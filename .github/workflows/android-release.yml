@@ -1,0 +1,154 @@
+name: Android release signée (APK + AAB)
+
+# La clé d'upload vit dans les secrets du dépôt et est reconstituée à l'identique ici,
+# sur macOS et sur toute machine de dev : l'empreinte ne dépend donc plus de la machine.
+# Le job échoue si l'empreinte obtenue diffère de EXPECTED_SHA1, aucun artifact ne peut
+# donc partir signé avec une autre clé.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "lib/**"
+      - "android/**"
+      - "assets/**"
+      - "pubspec.yaml"
+      - "pubspec.lock"
+      - ".github/workflows/android-release.yml"
+  workflow_dispatch:
+    inputs:
+      build_number:
+        description: "versionCode (défaut : numéro du run)"
+        required: false
+        default: ""
+
+env:
+  # Empreinte attendue de la clé d'upload, stockée en variable de dépôt pour qu'un
+  # changement de clé (reset Play, keystore retrouvé) ne demande aucun commit.
+  # gh variable set RELEASE_SHA1 --body "AA:BB:..." --repo TE-SEA-Incubator/TAKYMED-M
+  EXPECTED_SHA1: ${{ vars.RELEASE_SHA1 }}
+  KEYSTORE_PATH: android/takymed-upload.jks
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Vérifier la présence des secrets de signature
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "$KEYSTORE" ]; then
+            echo "::error::Secret ANDROID_KEYSTORE_BASE64 absent. Voir SIGNING.md."
+            exit 1
+          fi
+          if [ -z "$EXPECTED_SHA1" ]; then
+            echo "::error::Variable de dépôt RELEASE_SHA1 non définie. Voir SIGNING.md."
+            exit 1
+          fi
+          echo "Empreinte d'upload attendue : $EXPECTED_SHA1"
+
+      - name: Reconstituer la clé d'upload
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$KEYSTORE_PATH"
+          umask 077
+          {
+            echo "storePassword=$ANDROID_KEYSTORE_PASSWORD"
+            echo "keyPassword=$ANDROID_KEY_PASSWORD"
+            echo "keyAlias=$ANDROID_KEY_ALIAS"
+            echo "storeFile=takymed-upload.jks"
+            echo "storeType=PKCS12"
+          } > android/key.properties
+
+      - name: Contrôler l'empreinte du keystore reconstitué
+        run: |
+          set -euo pipefail
+          PASSWORD=$(sed -n 's/^storePassword=//p' android/key.properties)
+          HEX='([0-9A-Fa-f]{2}:){19}[0-9A-Fa-f]{2}'
+          ACTUAL=$(keytool -list -v -keystore "$KEYSTORE_PATH" -storepass "$PASSWORD" -alias "$(sed -n 's/^keyAlias=//p' android/key.properties)" \
+            | grep -iE 'sha.?1' | grep -oiE "$HEX" | head -1 | tr 'a-f' 'A-F')
+          EXPECTED=$(printf '%s' "$EXPECTED_SHA1" | tr 'a-f' 'A-F')
+          echo "keystore reconstitué : $ACTUAL"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::Keystore d'upload incorrect — attendu $EXPECTED."
+            exit 1
+          fi
+
+      - name: Install Flutter dependencies
+        run: flutter pub get
+
+      - name: Build APK + AAB
+        env:
+          BUILD_NUMBER: ${{ github.event.inputs.build_number }}
+        run: |
+          set -euo pipefail
+          VN="${BUILD_NUMBER:-$GITHUB_RUN_NUMBER}"
+          echo "versionCode = $VN"
+          echo "VERSION_CODE=$VN" >> "$GITHUB_ENV"
+          flutter build apk      --release --build-number="$VN"
+          flutter build appbundle --release --build-number="$VN"
+
+      - name: Vérifier la signature de l'APK
+        run: |
+          set -euo pipefail
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -1)
+          SHA=$("$APKSIGNER" verify --print-certs build/app/outputs/flutter-apk/app-release.apk \
+            | sed -n 's/^Signer #1 certificate SHA-1 digest: //p')
+          echo "APK signé par : $SHA"
+          [ "$SHA" = "$EXPECTED_SHA1" ] || { echo "::error::Empreinte inattendue sur l'APK."; exit 1; }
+
+      - name: Récupérer le nom de version
+        id: version
+        run: |
+          DISPLAY=$(sed -n 's/^version: *\([0-9][^+]*\).*/\1/p' pubspec.yaml)
+          echo "display=$DISPLAY" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: takymed-android-apk-${{ steps.version.outputs.display }}
+          path: build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Upload AAB (Google Play)
+        uses: actions/upload-artifact@v4
+        with:
+          name: takymed-android-aab-${{ steps.version.outputs.display }}
+          path: build/app/outputs/bundle/release/app-release.aab
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Résumé
+        run: |
+          {
+            echo "### Release Android TAKYMED v${{ steps.version.outputs.display }}"
+            echo ""
+            echo "- versionCode : \`$VERSION_CODE\`"
+            echo "- Clé d'upload ayant signé cette build : \`$EXPECTED_SHA1\`"
+            echo "- Empreinte exigée par Play Console à l'upload : à vérifier dans *Setup → App signing*"
+            echo ""
+            echo "Artifacts : onglet *Artifacts* de ce run."
+          } >> "$GITHUB_STEP_SUMMARY"
